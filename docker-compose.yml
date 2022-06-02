@@ -1,0 +1,116 @@
+version: "3.9"
+
+x-laravel-environment: &default-env
+  APP_NAME: ${APP_NAME:-CheapLandSearch}
+  APP_ENV: ${APP_ENV:-local}
+  APP_KEY: ${APP_KEY}
+  APP_DEBUG: ${APP_DEBUG:-true}
+  APP_URL: ${APP_URL:-http://localhost}
+  DB_HOST: db
+  DB_DATABASE: ${DB_DATABASE}
+  DB_USERNAME: ${DB_USERNAME}
+  DB_PASSWORD: ${DB_PASSWORD}
+  LOG_CHANNEL: stderr
+  MAIL_HOST: ${MAIL_HOST}
+  MAIL_PORT: ${MAIL_PORT}
+  MAIL_ENCRYPTION: ${MAIL_ENCRYPTION}
+  MAIL_USERNAME: ${MAIL_USERNAME}
+  MAIL_PASSWORD: ${MAIL_PASSWORD}
+  QUEUE_CONNECTION: redis
+  REDIS_HOST: redis
+
+x-laravel-build: &default-build
+  context: .
+  dockerfile: Dockerfile
+
+x-restrat-policy: &restart-policy unless-stopped
+
+x-default-worker: &default-worker
+  build:
+    <<: *default-build
+    target: php-cli
+    cache_from:
+      - "${WORKER_CACHE_IMAGE}:${IMAGE_CACHE_TAG}"
+      - "php:${PHP_VERSION:-8.1}-cli-${PHP_VARIANT:-alpine}"
+  restart: *restart-policy
+  depends_on:
+    - db
+
+services:
+  web:
+    build:
+      <<: *default-build
+      target: nginx
+      cache_from:
+        - "${WEB_CACHE_IMAGE}:${IMAGE_CACHE_TAG}"
+        - "nginx:${NGINX_VERSION:-1.21}-alpine"
+    restart: *restart-policy
+    depends_on:
+      - app
+
+  app:
+    build:
+      <<: *default-build
+      target: php-fpm
+      cache_from:
+        - "${APP_CACHE_IMAGE}:${IMAGE_CACHE_TAG}"
+        - "php:${PHP_VERSION:-8.1}-fpm-${PHP_VARIANT:-alpine}"
+    environment:
+      <<: *default-env
+      CONTAINER_ROLE: app
+    restart: *restart-policy
+    depends_on:
+      - db
+
+  worker:
+    <<: *default-worker
+    environment:
+      <<: *default-env
+      CONTAINER_ROLE: queue
+
+  worker-averages:
+    <<: *default-worker
+    environment:
+      <<: *default-env
+      CONTAINER_ROLE: queue
+      QUEUE_NAME: averages
+
+  worker-notifications:
+    <<: *default-worker
+    environment:
+      <<: *default-env
+      CONTAINER_ROLE: queue
+      QUEUE_NAME: notifications
+
+  scheduler:
+    <<: *default-worker
+    environment:
+      <<: *default-env
+      CONTAINER_ROLE: cron
+
+  db:
+    image: mysql:8.0
+    command:
+      - '--max-allowed-packet=32M'
+      - '--default-authentication-plugin=mysql_native_password'
+      - '--binlog-expire-logs-seconds=259200' # Sets the binary log expiration period in seconds
+    restart: *restart-policy
+    volumes:
+      - "db_data:/var/lib/mysql"
+    environment:
+      - MYSQL_DATABASE=${DB_DATABASE}
+      - MYSQL_USER=${DB_USERNAME}
+      - MYSQL_PASSWORD=${DB_PASSWORD}
+      - MYSQL_RANDOM_ROOT_PASSWORD=yes
+    cap_add: # https://github.com/docker-library/mysql/issues/303
+      - SYS_NICE
+
+  redis:
+    image: redis:6.2-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - "redis_data:/data"
+
+volumes:
+  db_data:
+  redis_data:

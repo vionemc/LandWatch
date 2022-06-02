@@ -1,0 +1,86 @@
+version: "3.9"
+
+x-laravel-volumes: &default-volumes
+  - "shared:/app/storage/app/shared"
+  - "cache:/app/storage/framework/cache"
+
+services:
+  web:
+    image: ${WEB_IMAGE}
+    ports:
+      - "80"
+    networks:
+      - default
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}_web.rule=Host(`${HOSTNAME}`)"
+      - "traefik.http.services.${COMPOSE_PROJECT_NAME}_web.loadbalancer.server.port=80"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}_web.tls=true"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}_web.tls.certresolver=lets-encrypt"
+
+  app:
+    image: ${APP_IMAGE}
+    build:
+      args:
+        DEVELOPMENT_MODE: 1
+    volumes: *default-volumes
+    environment:
+      APP_ENV: ${APP_ENV:-staging}
+      APP_DEBUG: "true"
+      TRUSTED_PROXY: ${REVERSE_PROXY_IP:-null}
+
+  worker:
+    image: ${WORKER_IMAGE}
+    build:
+      args:
+        DEVELOPMENT_MODE: 1
+    volumes: *default-volumes
+    environment:
+      APP_ENV: ${APP_ENV:-staging}
+      APP_DEBUG: "true"
+      QUEUE_MEMORY: 64
+
+  worker-averages:
+    image: ${WORKER_IMAGE}
+    build:
+      args:
+        DEVELOPMENT_MODE: 1
+    volumes: *default-volumes
+    environment:
+      APP_ENV: ${APP_ENV:-staging}
+      APP_DEBUG: "true"
+      QUEUE_MEMORY: 64
+
+  worker-notifications:
+    image: ${WORKER_IMAGE}
+    build:
+      args:
+        DEVELOPMENT_MODE: 1
+    volumes: *default-volumes
+    environment:
+      APP_ENV: ${APP_ENV:-staging}
+      APP_DEBUG: "true"
+      QUEUE_MEMORY: 64
+
+  scheduler:
+    image: ${WORKER_IMAGE}
+    build:
+      args:
+        DEVELOPMENT_MODE: 1
+    volumes: *default-volumes
+    environment:
+      APP_ENV: ${APP_ENV:-staging}
+      APP_DEBUG: "true"
+
+  db:
+    ports:
+      - "3306"
+
+networks:
+  proxy:
+    external: true
+
+volumes:
+  shared:
+  cache:

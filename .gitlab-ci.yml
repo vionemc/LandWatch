@@ -1,0 +1,178 @@
+stages:
+  - build
+  - test
+  - release
+  - deploy
+
+variables:
+  GIT_DEPTH: 5
+  FF_GITLAB_REGISTRY_HELPER_IMAGE: 1
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_MESSAGE =~ /-draft$/'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      variables:
+        COMPOSE_FILE: docker-compose.yml:docker-compose.staging.yml
+
+.login_to_registries: &login-to-docker-registries
+  - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+  - docker login -u "$DOCKER_HUB_USER" -p "$DOCKER_HUB_PASSWORD"
+
+default:
+  before_script:
+    - *login-to-docker-registries
+
+.compose-template:
+  image: docker/compose:alpine-1.29.2
+  variables:
+    # Specify to Docker where to create the certificates. Docker
+    # creates them automatically on boot, and creates
+    # `/certs/client` to share between the service and job
+    # container, thanks to volume mount from config.toml
+    DOCKER_TLS_CERTDIR: "/certs"
+    # Enable communication of docker client with host in the service through TLS
+    DOCKER_TLS_VERIFY: 1
+    # Specify path of client certificates created automatically
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+    # Character set to use as a path separator for multiple compose files
+    COMPOSE_PATH_SEPARATOR: ":"
+
+.dind-template:
+  extends: .compose-template
+  services:
+    - docker:20.10-dind
+  variables:
+    # docker image sets DOCKER_HOST, DOCKER_TLS_VERIFY and DOCKER_CERT_PATH automatically,
+    # but we need to do that for the docker/compose image used
+    # Set DOCKER_HOST to instruct docker to talk with the daemon started inside the service
+    DOCKER_HOST: "tcp://docker:2376"
+
+.build-template:
+  extends: .dind-template
+  stage: build
+  variables:
+    # Enable BuildKit builds
+    DOCKER_BUILDKIT: 1
+    # Use native docker cli for building images with docker-compose
+    COMPOSE_DOCKER_CLI_BUILD: 1
+    IMAGE_CACHE_TAG: $CI_COMMIT_BEFORE_SHA
+  interruptible: true
+  rules:
+    - exists:
+        - Dockerfile
+        - docker-compose.yml
+  script:
+    - |
+      if [ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]; then export IMAGE_CACHE_TAG='latest'; else export IMAGE_CACHE_TAG='$CI_COMMIT_BEFORE_SHA'; fi
+      if [ -n "$SERVICE_NAME" ]; then
+        image=$(docker-compose config | awk '/^[[:space:]][[:space:]]web:$/{flag=1} flag && /image:/{print $NF;flag=""}' | cut -d':' -f 1)
+        docker pull -q ${image}:$IMAGE_CACHE_TAG || true
+        docker-compose build --pull --build-arg BUILDKIT_INLINE_CACHE=1 ${SERVICE_NAME}
+        docker-compose push ${SERVICE_NAME}
+        if [ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]; then
+          docker tag ${image}:${DEFAULT_IMAGE_TAG} ${image}:latest
+          docker push ${image}:latest
+        fi
+      else
+        images=$(docker-compose config |  grep 'image: ' | cut -d':' -f 2 | grep "$CI_REGISTRY" | tr -d '["| ]')
+        for image in $images
+        do
+          docker pull -q ${image}:$IMAGE_CACHE_TAG || true
+        done
+        docker-compose build --pull --build-arg BUILDKIT_INLINE_CACHE=1
+        docker-compose push
+        if [ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]; then
+          for image in $images
+          do
+            docker tag ${image}:${DEFAULT_IMAGE_TAG} ${image}:latest
+            docker push ${image}:latest
+          done
+        fi
+      fi
+
+.deploy-template:
+  extends: .compose-template
+  stage: deploy
+  dependencies: []
+  variables:
+    COMPOSE_PROJECT_NAME: ${CI_PROJECT_NAME}_${CI_ENVIRONMENT_NAME}
+    COMPOSE_HTTP_TIMEOUT: 120
+    DOCKER_CLIENT_TIMEOUT: 120
+    COMPOSE_INTERACTIVE_NO_CLI: 1
+  before_script:
+    - mkdir -p ${DOCKER_CERT_PATH}
+    - echo "${DOCKER_TLS_CA_CERT}" | base64 -d > ${DOCKER_CERT_PATH}/ca.pem
+    - echo "${DOCKER_TLS_CERT}" | base64 -d > ${DOCKER_CERT_PATH}/cert.pem
+    - echo "${DOCKER_TLS_KEY}" | base64 -d > ${DOCKER_CERT_PATH}/key.pem
+    - *login-to-docker-registries
+
+services:build:
+  extends: .build-template
+  variables:
+    DEFAULT_IMAGE_TAG: ${CI_COMMIT_SHA}
+    WEB_IMAGE: ${CI_REGISTRY_IMAGE}/nginx:${DEFAULT_IMAGE_TAG}
+    APP_IMAGE: ${CI_REGISTRY_IMAGE}/app:${DEFAULT_IMAGE_TAG}
+    WORKER_IMAGE: ${CI_REGISTRY_IMAGE}/worker:${DEFAULT_IMAGE_TAG}
+    WEB_CACHE_IMAGE: ${CI_REGISTRY_IMAGE}/nginx
+    APP_CACHE_IMAGE: ${CI_REGISTRY_IMAGE}/app
+    WORKER_CACHE_IMAGE: ${CI_REGISTRY_IMAGE}/worker
+
+deploy_staging:
+  extends: .deploy-template
+  allow_failure: false
+  environment:
+    name: ${APP_ENV}
+    url: "https://${HOSTNAME}"
+  variables:
+    DOCKER_HOST: ${STAGING_DOCKER_HOST}
+    DOCKER_TLS_CA_CERT: ${STAGING_DOCKER_TLS_CA_CERT}
+    DOCKER_TLS_CERT: ${STAGING_DOCKER_TLS_CERT}
+    DOCKER_TLS_KEY: ${STAGING_DOCKER_TLS_KEY}
+    HOSTNAME: "landwatch.effio.online"
+    APP_NAME: "Cheap Land Search Staging"
+    APP_ENV: staging
+    APP_URL: "https://${HOSTNAME}"
+    APP_KEY: ${STAGING_APP_KEY}
+    DB_DATABASE: ${STAGING_DB_DATABASE}
+    DB_USERNAME: ${STAGING_DB_USERNAME}
+    DB_PASSWORD: ${STAGING_DB_PASSWORD}
+    WEB_IMAGE: ${CI_REGISTRY_IMAGE}/nginx:latest
+    APP_IMAGE: ${CI_REGISTRY_IMAGE}/app:latest
+    WORKER_IMAGE: ${CI_REGISTRY_IMAGE}/worker:latest
+  script:
+    - export REVERSE_PROXY_IP=`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' reverse-proxy`
+    - docker-compose pull -q
+    - docker-compose up -d --remove-orphans --scale worker=32 --scale worker-notifications=2
+
+deploy_production:
+  extends: .deploy-template
+  allow_failure: false
+  environment:
+    name: ${APP_ENV}
+    url: "https://${HOSTNAME}"
+  when: manual
+  variables:
+    DOCKER_HOST: ${PRODUCTION_DOCKER_HOST}
+    DOCKER_TLS_CA_CERT: ${PRODUCTION_DOCKER_TLS_CA_CERT}
+    DOCKER_TLS_CERT: ${PRODUCTION_DOCKER_TLS_CERT}
+    DOCKER_TLS_KEY: ${PRODUCTION_DOCKER_TLS_KEY}
+    COMPOSE_FILE: docker-compose.yml:docker-compose.production.yml
+    COMPOSE_PROJECT_NAME: cheaplandsearch
+    HOSTNAME: "cheaplandsearch.com"
+    APP_NAME: "Cheap Land Search"
+    APP_ENV: production
+    APP_URL: "https://${HOSTNAME}"
+    APP_KEY: ${PRODUCTION_APP_KEY}
+    DB_DATABASE: ${PRODUCTION_DB_DATABASE}
+    DB_USERNAME: ${PRODUCTION_DB_USERNAME}
+    DB_PASSWORD: ${PRODUCTION_DB_PASSWORD}
+    WEB_IMAGE: ${CI_REGISTRY_IMAGE}/nginx:latest
+    APP_IMAGE: ${CI_REGISTRY_IMAGE}/app:latest
+    WORKER_IMAGE: ${CI_REGISTRY_IMAGE}/worker:latest
+  script:
+    - export REVERSE_PROXY_IP=`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' reverse-proxy`
+    - docker-compose pull -q
+    - docker-compose up -d --remove-orphans --scale worker=64 --scale worker-notifications=2
