@@ -30,7 +30,7 @@ class Kernel extends ConsoleKernel
     protected function schedule(Schedule $schedule): void
     {
         // TODO: Postpone stale entries check after batch listings update
-        $schedule->job(new UpdateListings())->daily();
+        $schedule->job(new UpdateListings());
         $schedule->job(new UpdateUserAgentsFile())->monthly();
 
         // Cleanup
